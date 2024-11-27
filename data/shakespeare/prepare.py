@@ -1,6 +1,6 @@
 import os
 import requests
-import tiktoken
+import pickle
 import numpy as np
 
 # download the tiny shakespeare dataset
@@ -12,14 +12,36 @@ if not os.path.exists(input_file_path):
 
 with open(input_file_path, 'r', encoding='utf-8') as f:
     data = f.read()
-n = len(data)
-train_data = data[:int(n*0.9)]
-val_data = data[int(n*0.9):]
 
-# encode with tiktoken gpt2 bpe
-enc = tiktoken.get_encoding("gpt2")
-train_ids = enc.encode_ordinary(train_data)
-val_ids = enc.encode_ordinary(val_data)
+# get all unique characters
+chars = sorted(list(set(data)))
+
+# Add [MASK] as a special token
+chars.append('[MASK]')
+vocab_size = len(chars)
+
+# create the vocab
+stoi = { ch:i for i,ch in enumerate(chars) }
+itos = { i:ch for i,ch in enumerate(chars) }
+
+# Store special token IDs
+mask_token = '[MASK]'
+mask_token_id = stoi[mask_token]
+
+print(f"Vocabulary size (including special tokens): {vocab_size}")
+print(f"Mask token '{mask_token}' has ID: {mask_token_id}")
+
+# encode the dataset
+train_data = data[:int(0.9*len(data))]
+val_data = data[int(0.9*len(data)):]
+
+# encode both to integers
+def encode(s): return [stoi[c] for c in s]
+def decode(l): return ''.join([itos[i] for i in l])
+
+# create the train and val datasets
+train_ids = encode(train_data)
+val_ids = encode(val_data)
 print(f"train has {len(train_ids):,} tokens")
 print(f"val has {len(val_ids):,} tokens")
 
@@ -29,5 +51,19 @@ val_ids = np.array(val_ids, dtype=np.uint16)
 train_ids.tofile(os.path.join(os.path.dirname(__file__), 'train.bin'))
 val_ids.tofile(os.path.join(os.path.dirname(__file__), 'val.bin'))
 
-# train.bin has 301,966 tokens
-# val.bin has 36,059 tokens
+# save the meta information
+meta = {
+    'vocab_size': vocab_size,
+    'itos': itos,
+    'stoi': stoi,
+    'mask_token': mask_token,
+    'mask_token_id': mask_token_id,
+}
+with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
+    pickle.dump(meta, f)
+
+# print a sample decode
+sample_ids = train_ids[:1000]
+decoded = decode(sample_ids)
+print(f"\nSample decode from train.bin:")
+print(decoded[:100])

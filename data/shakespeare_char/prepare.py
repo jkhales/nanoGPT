@@ -22,6 +22,8 @@ print(f"length of dataset in characters: {len(data):,}")
 
 # get all the unique characters that occur in this text
 chars = sorted(list(set(data)))
+# Add [MASK] token to vocabulary
+chars.append('[MASK]')
 vocab_size = len(chars)
 print("all the unique characters:", ''.join(chars))
 print(f"vocab size: {vocab_size:,}")
@@ -29,6 +31,10 @@ print(f"vocab size: {vocab_size:,}")
 # create a mapping from characters to integers
 stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
+mask_token = '[MASK]'
+mask_token_id = stoi[mask_token]
+print(f"mask token '{mask_token}' has id: {mask_token_id}")
+
 def encode(s):
     return [stoi[c] for c in s] # encoder: take a string, output a list of integers
 def decode(l):
@@ -56,13 +62,15 @@ meta = {
     'vocab_size': vocab_size,
     'itos': itos,
     'stoi': stoi,
+    'mask_token': mask_token,
+    'mask_token_id': mask_token_id,
 }
 with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
     pickle.dump(meta, f)
 
-# length of dataset in characters:  1115394
-# all the unique characters:
-#  !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
-# vocab size: 65
-# train has 1003854 tokens
-# val has 111540 tokens
+# print a sample decode just to make sure it works
+sample_ids = train_ids[:1000].tolist()  # sample ids from train set
+decoded = decode(sample_ids)
+print("-" * 50)
+print("Sample decode from train.bin:")
+print(decoded[:100], "...")

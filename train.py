@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from mask import create_mask_attention
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -78,6 +79,12 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+meta_path = os.path.join('data', dataset, 'meta.pkl')
+with open(meta_path, 'rb') as f:
+    meta = pickle.load(f)
+vocab_size = meta['vocab_size']
+mask_token_id = meta['mask_token_id']
+
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
@@ -113,7 +120,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
+def get_batch(split, mask_prob=0.15):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
@@ -122,7 +129,17 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    
+    # Ensure all token IDs are within vocabulary size
+    vocab_size = model.config.vocab_size
+    x = torch.clamp(x, 0, vocab_size - 1)
+    
+    y = x.clone()
+    
+    probability_matrix = torch.full(x.shape, mask_prob)
+    masked_indices = torch.bernoulli(probability_matrix).bool()
+    x[masked_indices] = mask_token_id
+
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -151,8 +168,10 @@ if init_from == 'scratch':
     print("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+        print("Warning: meta_vocab_size not found in meta.pkl, using vocab_size from meta")
+        meta_vocab_size = meta['vocab_size']  # Use vocab_size from meta instead
+    print(f"Setting vocab size to: {meta_vocab_size}")
+    model_args['vocab_size'] = meta_vocab_size
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
@@ -192,6 +211,12 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
+# print(f"Tokenizer vocab size: {len(tokenizer)}")
+print(f"Mask token ID: {mask_token_id}")
+
+# After model initialization
+print(f"Model vocab size: {model.config.vocab_size}")
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
@@ -220,9 +245,17 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
+            # Use the same masking function as in training
+            attention_mask = create_mask_attention(X, mask_token_id)
+            
+            # Ensure we're not getting NaN from empty masks
+            if not (X == model.mask_token_id).any():
+                continue
+                
+            logits, loss = model(X, Y, attention_mask=attention_mask)
+            assert loss is not None
             losses[k] = loss.item()
+
         out[split] = losses.mean()
     model.train()
     return out
@@ -297,7 +330,8 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            attention_mask = create_mask_attention(X, mask_token_id)
+            logits, loss = model(X, Y, attention_mask=attention_mask)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
